@@ -22,14 +22,3 @@ def unaccent(s):
     s = unicodedata.normalize("NFD", s.lower().replace("đ", "d"))
     s = "".join(c for c in s if unicodedata.category(c) != "Mn")
     return re.sub(r"\s+", " ", s)
-
-
-def window(cfg, model_key):
-    """[bắt đầu, kết thúc] của dữ liệu comment. Model 'both' (video so sánh) lấy cửa sổ hợp nhất."""
-    keys = ["main", "rival"] if model_key == "both" else [model_key]
-    starts, ends = [], []
-    for k in keys:
-        d = datetime.fromisoformat(cfg["models"][k]["launch_date"]).replace(tzinfo=ICT)
-        starts.append(d.astimezone(timezone.utc))
-        ends.append(starts[-1] + timedelta(weeks=cfg["window_weeks"]))
-    return min(starts), max(ends)

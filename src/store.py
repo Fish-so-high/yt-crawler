@@ -18,9 +18,11 @@ VIDEO_EXTRA_COLS = {"channel_title": "TEXT", "video_type": "TEXT", "view_count":
 
 def connect(path):
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30)
+    conn = sqlite3.connect(path, timeout=60)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=60000")
+    conn.execute("PRAGMA synchronous=NORMAL")   # WAL + NORMAL: commit nhanh, giữ khóa ghi ngắn hơn
     conn.executescript(SCHEMA)
     have = {r[1] for r in conn.execute("PRAGMA table_info(videos)")}
     for name, typ in VIDEO_EXTRA_COLS.items():

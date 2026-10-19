@@ -1,14 +1,32 @@
+import logging
+import random
 import time
 import requests
 from .quota import QuotaExceeded
+
+
+log = logging.getLogger("youtube")
 
 
 class CommentsDisabled(Exception):
     pass
 
 
+class YouTubeError(Exception):
+    """Lỗi từ phía YouTube/mạng, không phải lỗi hạn mức."""
+
+
+class TransientError(YouTubeError):
+    """Lỗi tạm thời (mạng, 429, 5xx) vẫn còn sau khi đã thử lại nhiều lần."""
+
+
+class ApiError(YouTubeError):
+    """API trả lỗi không thể thử lại (ví dụ playlistNotFound, forbidden)."""
+
+
 class YouTube:
     BASE = "https://www.googleapis.com/youtube/v3"
+    RETRIES = 5
 
     def __init__(self, api_key, ledger):
         if not api_key:
@@ -25,14 +43,18 @@ class YouTube:
     def _call(self, method, endpoint, **params):
         self.ledger.charge(method)
         params["key"] = self.key
-        for attempt in range(4):
+        last = ""
+        for attempt in range(self.RETRIES):
+            wait = min(60, 3 * 2 ** attempt) + random.random()
             try:
-                r = self.s.get(f"{self.BASE}/{endpoint}", params=params, timeout=30)
-            except requests.RequestException:
-                time.sleep(2 ** attempt)
+                r = self.s.get(f"{self.BASE}/{endpoint}", params=params, timeout=(10, 30))
+            except requests.RequestException as e:
+                last = f"lỗi mạng {type(e).__name__}: {str(e)[:150]}"
+                log.warning("%s lần %d/%d: %s", endpoint, attempt + 1, self.RETRIES, last)
+                time.sleep(wait)
                 continue
             if r.status_code == 200:
-                time.sleep(0.05)
+                time.sleep(0.1)
                 return r.json()
             reason = self._reason(r)
             if r.status_code == 403 and reason in ("quotaExceeded", "dailyLimitExceeded"):
@@ -40,11 +62,13 @@ class YouTube:
                 raise QuotaExceeded(reason)
             if reason in ("commentsDisabled", "videoNotFound"):
                 raise CommentsDisabled(reason)
-            if r.status_code in (429, 500, 502, 503, 504) or reason == "rateLimitExceeded":
-                time.sleep(2 ** attempt * 2)
+            if r.status_code in (429, 500, 502, 503, 504) or reason in ("rateLimitExceeded", "userRateLimitExceeded"):
+                last = f"HTTP {r.status_code} {reason}"
+                log.warning("%s lần %d/%d: %s", endpoint, attempt + 1, self.RETRIES, last)
+                time.sleep(wait)
                 continue
-            r.raise_for_status()
-        raise RuntimeError(f"{endpoint}: thất bại sau 4 lần thử")
+            raise ApiError(f"{endpoint}: HTTP {r.status_code} {reason}: {r.text[:300]}")
+        raise TransientError(f"{endpoint}: thất bại sau {self.RETRIES} lần thử, lỗi cuối: {last}")
 
     def channel(self, handle=None, channel_id=None):
         p = {"part": "snippet,contentDetails"}
@@ -83,3 +107,11 @@ class YouTube:
 
     def search_videos(self, **params):
         return self._call("search.list", "search", part="snippet", type="video", maxResults=50, **params)
+
+    def search_channels(self, name):
+        return self._call("search.list", "search", part="snippet", type="channel", q=name,
+                          regionCode="VN", relevanceLanguage="vi", maxResults=3)
+
+    def channels_info(self, ids):
+        return self._call("channels.list", "channels", part="snippet,statistics",
+                          id=",".join(ids)).get("items", [])

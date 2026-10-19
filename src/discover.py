@@ -3,27 +3,39 @@
 import json
 import logging
 import re
-from datetime import timedelta
-from .config import RAW_DIR
+from . import config
 from .quota import QuotaExceeded
 from .schema import SCHEMA_VERSION
-from .timeutil import iso, now, parse, unaccent, window
+from .youtube import YouTubeError
+from .models import bounds, classify, window
+from .timeutil import iso, now, parse, unaccent
 
 log = logging.getLogger("discover")
 
 
 def resolve_channels(cfg, yt, conn):
+    """Đọc mục channels: channel_id (UC... hoặc @handle), name, enabled, tags."""
     out = []
     for ch in cfg.get("channels") or []:
-        key = ch.get("handle") or ch.get("channel_id") or ch.get("id")
+        if not ch.get("enabled", True):
+            continue
+        key = ch.get("channel_id") or ch.get("handle") or ch.get("id")
+        if not key:
+            log.warning("Bỏ qua '%s': chưa có channel_id (chạy resolve-names hoặc tự điền)", ch.get("name"))
+            continue
         row = conn.execute("SELECT * FROM channels WHERE handle=? OR channel_id=?", (key, key)).fetchone()
         if not row:
-            item = yt.channel(handle=ch.get("handle"), channel_id=ch.get("channel_id") or ch.get("id"))
+            by_handle = key.startswith("@")
+            try:
+                item = yt.channel(handle=key if by_handle else None, channel_id=None if by_handle else key)
+            except YouTubeError as e:
+                log.warning("Bỏ qua kênh %s (%s): %s", key, ch.get("name"), e)
+                continue
             if not item:
-                log.warning("Không tìm thấy kênh %s", key)
+                log.warning("Không tìm thấy kênh %s (%s)", key, ch.get("name"))
                 continue
             conn.execute("INSERT OR REPLACE INTO channels VALUES(?,?,?,?)", (
-                item["id"], ch.get("handle"), item["snippet"]["title"],
+                item["id"], key if by_handle else None, item["snippet"]["title"],
                 item["contentDetails"]["relatedPlaylists"]["uploads"]))
             conn.commit()
             row = conn.execute("SELECT * FROM channels WHERE channel_id=?", (item["id"],)).fetchone()
@@ -31,12 +43,18 @@ def resolve_channels(cfg, yt, conn):
     return out
 
 
-def classify(cfg, title):
-    t = unaccent(title)
-    hit = {k: any(unaccent(a) in t for a in cfg["models"][k]["aliases"]) for k in ("main", "rival")}
-    if hit["main"] and hit["rival"]:
-        return "both"
-    return "main" if hit["main"] else "rival" if hit["rival"] else None
+def suggest_channel_ids(cfg, yt, limit=20):
+    """Với kênh chỉ có name: search.list (100 đơn vị/kênh) + channels.list (1 đơn vị) để gợi ý channel_id.
+    Trả về [(mục cấu hình, [channelId...], {channelId: thông tin})]. Người dùng PHẢI kiểm tra lại bằng mắt."""
+    todo = [c for c in cfg.get("channels") or []
+            if c.get("name") and not (c.get("channel_id") or c.get("handle") or c.get("id"))][:limit]
+    out = []
+    for ch in todo:
+        d = yt.search_channels(ch["name"])
+        ids = [(it.get("id") or {}).get("channelId") or it["snippet"]["channelId"] for it in d.get("items", [])]
+        info = {i["id"]: i for i in yt.channels_info(ids)} if ids else {}
+        out.append((ch, ids, info))
+    return out
 
 
 def classify_type(title):
@@ -51,12 +69,12 @@ def classify_type(title):
     return "review"
 
 
-def refresh_videos(yt, conn, ids):
+def refresh_videos(yt, conn, ids, cfg=None):
     """Chụp số liệu video (view/like/comment) kèm fetched_at; mỗi lần chụp là 1 dòng trong
     data/raw/videos-YYYYMMDD.jsonl. 1 đơn vị quota cho mỗi 50 video."""
-    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    config.RAW_DIR.mkdir(parents=True, exist_ok=True)
     fetched = iso(now())
-    path = RAW_DIR / f"videos-{now():%Y%m%d}.jsonl"
+    path = config.raw_path(cfg, "videos")
     for i in range(0, len(ids), 50):
         lines = []
         for v in yt.videos(ids[i:i + 50]):
@@ -84,9 +102,7 @@ def refresh_videos(yt, conn, ids):
 
 
 def run_discover(cfg, yt, conn):
-    before = timedelta(days=cfg["video_window_before_days"])
-    w = [window(cfg, k) for k in ("main", "rival")]
-    earliest, latest = min(x[0] for x in w) - before, max(x[1] for x in w)
+    earliest, latest = bounds(cfg)
     new_ids = []
     for ch in resolve_channels(cfg, yt, conn):
         try:
@@ -96,7 +112,7 @@ def run_discover(cfg, yt, conn):
                     break  # uploads xếp mới -> cũ nên dừng được
                 if pub > latest:
                     continue
-                model = classify(cfg, it["snippet"]["title"])
+                model = classify(cfg, it["snippet"]["title"], pub)
                 if not model:
                     continue
                 vid = it["contentDetails"]["videoId"]
@@ -105,13 +121,25 @@ def run_discover(cfg, yt, conn):
                     (vid, ch["channel_id"], it["snippet"]["title"], iso(pub), model))
                 if cur.rowcount:
                     new_ids.append(vid)
+                else:   # video đã biết: nếu nhãn mới khác nhãn cũ
+                    old = conn.execute("SELECT model, status FROM videos WHERE video_id=?", (vid,)).fetchone()
+                    if old and old["model"] != model:
+                        if old["status"] == "pending":   # chưa cào gì -> cập nhật nhãn an toàn
+                            conn.execute("UPDATE videos SET model=? WHERE video_id=?", (model, vid))
+                        else:
+                            log.info("Video %s đã cào với nhãn '%s', nay khớp '%s': giữ nhãn cũ", vid, old["model"], model)
+                conn.commit()   # không giữ transaction mở trong lúc chờ trang uploads kế tiếp
             conn.commit()
         except QuotaExceeded as e:
             log.warning("Dừng discover: %s", e)
             break
+        except YouTubeError as e:
+            conn.commit()   # giữ lại các video đã tìm được của kênh này
+            log.warning("Kênh %s lỗi, bỏ qua, sẽ thử lại ở lần sau: %s", ch["title"], e)
+            continue
     try:
-        refresh_videos(yt, conn, new_ids)
-    except QuotaExceeded as e:
+        refresh_videos(yt, conn, new_ids, cfg)
+    except (QuotaExceeded, YouTubeError) as e:
         log.warning("Chưa lấy được thống kê video: %s", e)
     log.info("Discover xong: %d video mới", len(new_ids))
     return len(new_ids)
@@ -120,9 +148,7 @@ def run_discover(cfg, yt, conn):
 def find_channels(cfg, yt, queries, calls=3):
     """Tìm kênh ứng viên bằng search.list (100 đơn vị/lần, giới hạn số lần). Chỉ chạy tay."""
     from collections import Counter
-    m = cfg["models"]
-    start = min(window(cfg, "main")[0], window(cfg, "rival")[0])
-    end = max(window(cfg, "main")[1], window(cfg, "rival")[1])
+    start, end = bounds(cfg)
     cnt, ids = Counter(), {}
     for q in queries[:calls]:
         d = yt.search_videos(q=q, regionCode="VN", relevanceLanguage="vi",
