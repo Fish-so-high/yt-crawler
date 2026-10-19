@@ -1,0 +1,55 @@
+timezone: Asia/Ho_Chi_Minh
+
+quota:
+  daily_limit: 10000      # hạn mức mặc định của YouTube Data API v3
+  safety_ratio: 0.85      # chỉ dùng tối đa 85% để chừa dư địa
+  search_daily_cap: 80    # search.list rất đắt (100 đơn vị/lần), chặn cứng số lần/ngày
+
+discover:
+  run_budget_units: 600
+
+crawl:
+  run_budget_units: 600          # ngân sách mỗi lần chạy job crawl
+  min_poll_interval_min: 30      # video còn trong cửa sổ theo dõi: tối thiểu bao phút mới cào lại
+  older_streak_stop: 3           # dừng phân trang khi gặp liên tiếp N comment cũ hơn mốc (chịu được comment ghim)
+
+schedule:
+  discover_cron_hour: 6          # giờ VN, chạy tìm video mới mỗi ngày
+  crawl_every_min: 30
+
+# Cửa sổ dữ liệu theo đề tài: từ ngày ra mắt đến 4 tuần sau
+window_weeks: 4
+video_window_before_days: 7      # nhận cả video hands-on đăng trước ra mắt vài ngày
+
+# === ĐIỀN SAU KHI CHỐT MẪU MÁY (mục còn mở #1) ===
+models:
+  main:
+    name: "Iphone 15 Pro max"
+    aliases: ["Iphone 15 Pro Max", "Iphone15 prm", "ip15 prm", "ip15 pro max", "Táo 15 pro max", "Táo 15 prm", "15 pro max"]       # cách người ta gọi trong tiêu đề video, có/không dấu đều được
+    launch_date: "2023-09-12"    # ngày ra mắt tại VN (YYYY-MM-DD)
+  rival:
+    name: "Samsung Galaxy S24 Ultra"
+    aliases: ["samsung s24", "Samsung Galaxy S24 Ultra", "S24"]
+    launch_date: "2024-01-10"
+
+# Kênh công nghệ (10-20 kênh). channel_id điền UC... hoặc @handle; để trống thì chạy:
+#   python -m src.main resolve-names     (tốn ~100 đơn vị/kênh, ghi gợi ý ra config/channels.suggested.yaml)
+# Tên dưới đây là ỨNG VIÊN lấy từ các bài tổng hợp, chưa kiểm tra bằng API. tags tạm, sửa tùy ý.
+channels:
+  - {channel_id: "UCEeXA5Tu7n9X5_zkOgGsyww", name: "Vật Vờ Studio",    enabled: true, tags: ["review", "smartphone"]}
+  - {channel_id: "UCOygiQNXiiQ_rpRjHU5ri-A", name: "Duy Thẩm",         enabled: true, tags: ["review", "smartphone"]}
+  - {channel_id: "UCvJ8leyn7YWgqmbmw1R5ZVg", name: "Dương Dê",         enabled: true, tags: ["review", "smartphone"]}
+  - {channel_id: "UC0W4geJiYGuQeO5KhRBzXBQ", name: "Tân Một Cú",       enabled: true, tags: ["review", "smartphone"]}
+  - {channel_id: "UC7CplVVDYKBeraVcPuI3xUQ", name: "Tony Phùng",       enabled: true, tags: ["review", "smartphone"]}
+  - {channel_id: "UCyQobySFx_h9oFwsBV0KGdg", name: "Tinh tế",          enabled: true, tags: ["technology", "comparison"]}
+  - {channel_id: "UCJm_GdFJzT8h1odq1oMu_7Q", name: "Hoàng Hà Mobile",  enabled: true, tags: ["retail", "smartphone"]}
+  - {channel_id: "UCkv1DN-G2KP3D5RFFrEOW1Q", name: "CellphoneS",       enabled: true, tags: ["retail", "smartphone"]}
+  - {channel_id: "UClAoXGpwSi4bgwBLuZKxsnQ", name: "Thế Giới Di Động", enabled: true, tags: ["retail", "smartphone"]}
+  - {channel_id: "UCReIrO3npnrMpRzB5xgE7fQ", name: "FPT Shop",         enabled: true, tags: ["retail", "smartphone"]}
+  - {channel_id: "UCQ0jSGgYMLmRMeTE6UaPPXg", name: "Duy Luân Dễ Thương", enabled: true, tags: ["review", "smartphone"]}
+  - {channel_id: "UC9Pj0EUibBF295jWHRSDJqg", name: "Schannel",           enabled: true, tags: ["technology", "review"]}
+  - {channel_id: "UCDri2yZO_tqdD70bK-D7iQg", name: "AnhEm TV",           enabled: true, tags: ["technology", "review"]}
+  - {channel_id: "UCKOlBXzWA1PVOFd-MwC8AWQ", name: "Rương Công Nghệ",    enabled: true, tags: ["technology", "smartphone"]}
+
+
+  
