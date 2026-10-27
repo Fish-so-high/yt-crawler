@@ -1,13 +1,16 @@
 """Tìm video review/unbox/so sánh từ danh sách kênh. Tiết kiệm hạn mức: KHÔNG dùng search.list,
-đi qua playlist 'uploads' của kênh (1 đơn vị / 50 video) rồi lọc theo tiêu đề + ngày đăng."""
+đi qua playlist 'uploads' của kênh (1 đơn vị / 50 video) rồi lọc theo tiêu đề + ngày đăng.
+
+Quét TĂNG DẦN: mọi video đã đọc được lưu vào bảng `uploads`, tiến độ từng kênh lưu ở `channel_scan`.
+Lần sau chỉ đọc video mới đăng + phần quá khứ chưa quét; phân loại theo config chạy trên cache (0 quota)."""
 import json
 import logging
 import re
 from . import config
 from .quota import QuotaExceeded
 from .schema import SCHEMA_VERSION
-from .youtube import YouTubeError
-from .models import bounds, classify, window
+from .youtube import ApiError, YouTubeError
+from .models import bounds, classify, specs
 from .timeutil import iso, now, parse, unaccent
 
 log = logging.getLogger("discover")
@@ -101,48 +104,192 @@ def refresh_videos(yt, conn, ids, cfg=None):
         conn.commit()
 
 
-def run_discover(cfg, yt, conn):
-    earliest, latest = bounds(cfg)
-    new_ids = []
-    for ch in resolve_channels(cfg, yt, conn):
-        try:
-            for it in yt.uploads(ch["uploads_playlist"]):
-                pub = parse(it["contentDetails"].get("videoPublishedAt") or it["snippet"]["publishedAt"])
-                if pub < earliest:
-                    break  # uploads xếp mới -> cũ nên dừng được
-                if pub > latest:
-                    continue
-                model = classify(cfg, it["snippet"]["title"], pub)
-                if not model:
-                    continue
-                vid = it["contentDetails"]["videoId"]
-                cur = conn.execute(
-                    "INSERT OR IGNORE INTO videos(video_id,channel_id,title,published_at,model) VALUES(?,?,?,?,?)",
-                    (vid, ch["channel_id"], it["snippet"]["title"], iso(pub), model))
-                if cur.rowcount:
-                    new_ids.append(vid)
-                else:   # video đã biết: nếu nhãn mới khác nhãn cũ
-                    old = conn.execute("SELECT model, status FROM videos WHERE video_id=?", (vid,)).fetchone()
-                    if old and old["model"] != model:
-                        if old["status"] == "pending":   # chưa cào gì -> cập nhật nhãn an toàn
-                            conn.execute("UPDATE videos SET model=? WHERE video_id=?", (model, vid))
-                        else:
-                            log.info("Video %s đã cào với nhãn '%s', nay khớp '%s': giữ nhãn cũ", vid, old["model"], model)
-                conn.commit()   # không giữ transaction mở trong lúc chờ trang uploads kế tiếp
+def _left(yt):
+    """Số đơn vị còn lại trong ngân sách của lần chạy này."""
+    led = yt.ledger
+    return float("inf") if led.run_limit is None else led.run_limit - led.run_used
+
+
+def _item_pub(it):
+    return parse(it["contentDetails"].get("videoPublishedAt") or it["snippet"]["publishedAt"])
+
+
+def _cache_page(conn, channel_id, items):
+    """Lưu mọi video của trang vào bảng uploads; trả về danh sách ngày đăng (để dời con trỏ quét)."""
+    pubs = []
+    for it in items:
+        pub = _item_pub(it)
+        pubs.append(pub)
+        if not it["contentDetails"].get("videoPublishedAt"):
+            continue   # video riêng tư/đã xóa: không có ngày đăng thật, không lưu
+        conn.execute("INSERT OR REPLACE INTO uploads VALUES(?,?,?,?)",
+                     (it["contentDetails"]["videoId"], channel_id, it["snippet"]["title"], iso(pub)))
+    return pubs
+
+
+def _scan_state(conn, cid):
+    conn.execute("INSERT OR IGNORE INTO channel_scan(channel_id) VALUES(?)", (cid,))
+    conn.commit()   # nhả khóa ghi TRƯỚC khi gọi mạng (sổ quota ghi bằng kết nối riêng), kể cả khi không chèn gì
+    return conn.execute("SELECT * FROM channel_scan WHERE channel_id=?", (cid,)).fetchone()
+
+
+def _needs_backfill(st, earliest):
+    return not st["tail_done"] and (st["tail_pub"] is None or parse(st["tail_pub"]) >= earliest)
+
+
+def _scan_head(conn, yt, ch, reserve):
+    """Kênh đã quét trước đây: chỉ đọc từ đầu playlist tới khi gặp lại video mới nhất đã biết
+    (thường 1 trang = 1 đơn vị). Chưa tới được mốc cũ (hết ngân sách) thì chưa dời head_pub, lần sau làm lại."""
+    cid = ch["channel_id"]
+    st = _scan_state(conn, cid)
+    if not st["head_pub"]:
+        return
+    head = parse(st["head_pub"])
+    newest, token = head, None
+    while _left(yt) > reserve:
+        items, token = yt.uploads_page(ch["uploads_playlist"], token)
+        pubs = _cache_page(conn, cid, items)
+        if pubs:
+            newest = max(newest, max(pubs))
+        conn.execute("UPDATE channel_scan SET pages=pages+1 WHERE channel_id=?", (cid,))
+        if not token or any(p <= head for p in pubs):
+            conn.execute("UPDATE channel_scan SET head_pub=?, last_scan=? WHERE channel_id=?",
+                         (iso(newest), iso(now()), cid))
             conn.commit()
-        except QuotaExceeded as e:
-            log.warning("Dừng discover: %s", e)
-            break
-        except YouTubeError as e:
-            conn.commit()   # giữ lại các video đã tìm được của kênh này
-            log.warning("Kênh %s lỗi, bỏ qua, sẽ thử lại ở lần sau: %s", ch["title"], e)
-            continue
+            return
+        conn.commit()
+
+
+def _backfill_page(conn, yt, ch):
+    """Quét thêm MỘT trang về quá khứ, lưu con trỏ ngay sau mỗi trang (dừng giữa chừng không mất tiến độ)."""
+    cid = ch["channel_id"]
+    st = _scan_state(conn, cid)
     try:
-        refresh_videos(yt, conn, new_ids, cfg)
+        items, nxt = yt.uploads_page(ch["uploads_playlist"], st["tail_token"])
+    except ApiError as e:
+        if not st["tail_token"]:
+            raise
+        log.warning("Kênh %s: page token cũ không dùng được (%s), quét lại từ đầu playlist", ch["title"], e)
+        conn.execute("UPDATE channel_scan SET tail_token=NULL WHERE channel_id=?", (cid,))
+        conn.commit()
+        return
+    pubs = _cache_page(conn, cid, items)
+    tail = min([parse(st["tail_pub"])] + pubs if st["tail_pub"] else pubs, default=None)
+    head = st["head_pub"] or (iso(max(pubs)) if pubs else None)
+    conn.execute("UPDATE channel_scan SET tail_token=?, tail_pub=?, tail_done=?, head_pub=?, pages=pages+1, "
+                 "last_scan=? WHERE channel_id=?",
+                 (nxt, iso(tail) if tail else st["tail_pub"], 0 if nxt else 1, head, iso(now()), cid))
+    conn.commit()
+
+
+def scan_channels(cfg, yt, conn, channels, earliest):
+    """Bước 1 (tốn quota): cập nhật bộ nhớ đệm uploads.
+    a) Kênh đã quét: chỉ đọc phần video mới đăng.
+    b) Kênh chưa quét xong (kênh mới thêm, hoặc config thêm mẫu cũ hơn): quét tiếp về quá khứ theo
+       vòng tròn, mỗi kênh MỘT trang mỗi lượt, để ngân sách chia đều cho mọi kênh thay vì kênh đầu
+       danh sách ăn hết như trước."""
+    reserve = (cfg.get("discover") or {}).get("reserve_units", 20)   # chừa quota cho bước lấy thống kê video
+    for ch in channels:
+        try:
+            _scan_head(conn, yt, ch, reserve)
+        except YouTubeError as e:
+            conn.commit()
+            log.warning("Kênh %s lỗi khi quét video mới, bỏ qua lần này: %s", ch["title"], e)
+    todo = [ch for ch in channels if _needs_backfill(_scan_state(conn, ch["channel_id"]), earliest)]
+    conn.commit()
+    if todo:
+        log.info("Quét lùi về quá khứ cho %d kênh (mốc sớm nhất cần: %s)", len(todo), iso(earliest))
+    while todo and _left(yt) > reserve:
+        nxt = []
+        for ch in todo:
+            if _left(yt) <= reserve:
+                break   # hết ngân sách giữa vòng; con trỏ đã lưu, lần chạy sau làm tiếp
+            try:
+                _backfill_page(conn, yt, ch)
+            except YouTubeError as e:
+                conn.commit()
+                log.warning("Kênh %s lỗi, bỏ qua, sẽ thử lại ở lần sau: %s", ch["title"], e)
+                continue
+            if _needs_backfill(_scan_state(conn, ch["channel_id"]), earliest):
+                nxt.append(ch)
+        todo = nxt
+    conn.commit()
+    left = [ch["title"] for ch in channels if _needs_backfill(_scan_state(conn, ch["channel_id"]), earliest)]
+    if left:
+        log.warning("Còn %d kênh chưa quét đủ về %s (hết ngân sách lần chạy). Chạy discover thêm lần nữa, "
+                    "hoặc `discover --budget 3000`: %s", len(left), iso(earliest)[:10], ", ".join(left))
+    return left
+
+
+def classify_cached(cfg, conn, channels):
+    """Bước 2 (KHÔNG tốn quota): phân loại lại toàn bộ uploads đã lưu theo config hiện tại.
+    Trả về danh sách video mới thêm vào bảng videos."""
+    earliest, latest = bounds(cfg)
+    sp = specs(cfg)
+    ids = [ch["channel_id"] for ch in channels]
+    if not ids:
+        return []
+    marks = ",".join("?" * len(ids))
+    rows = conn.execute(f"SELECT * FROM uploads WHERE channel_id IN ({marks}) AND published_at BETWEEN ? AND ? "
+                        "ORDER BY published_at DESC", (*ids, iso(earliest), iso(latest))).fetchall()
+    new_ids, relabeled, revived = [], 0, 0
+    for u in rows:
+        pub = parse(u["published_at"])
+        model = classify(cfg, u["title"], pub, sp)
+        if not model:
+            continue
+        vid = u["video_id"]
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO videos(video_id,channel_id,title,published_at,model) VALUES(?,?,?,?,?)",
+            (vid, u["channel_id"], u["title"], iso(pub), model))
+        if cur.rowcount:
+            new_ids.append(vid)
+            continue
+        old = conn.execute("SELECT model, status FROM videos WHERE video_id=?", (vid,)).fetchone()
+        if old["status"] == "excluded":   # trước đây không khớp mẫu nào, nay khớp -> cào
+            conn.execute("UPDATE videos SET model=?, status='pending', page_token=NULL, watermark=NULL, "
+                         "pending_max=NULL WHERE video_id=?", (model, vid))
+            revived += 1
+        elif old["model"] != model:
+            if old["status"] == "pending":   # chưa cào gì -> cập nhật nhãn an toàn
+                conn.execute("UPDATE videos SET model=? WHERE video_id=?", (model, vid))
+                relabeled += 1
+            else:
+                log.info("Video %s đã cào với nhãn '%s', nay khớp '%s': giữ nhãn cũ "
+                         "(chạy `repair-missing` để đổi nhãn dữ liệu đã cào)", vid, old["model"], model)
+    conn.commit()
+    log.info("Phân loại %d video trong cache (%s -> %s): %d mới, %d đổi nhãn, %d mở lại",
+             len(rows), iso(earliest)[:10], iso(latest)[:10], len(new_ids), relabeled, revived)
+    return new_ids
+
+
+def run_discover(cfg, yt, conn):
+    earliest, _ = bounds(cfg)
+    channels = resolve_channels(cfg, yt, conn)
+    try:
+        scan_channels(cfg, yt, conn, channels, earliest)
+    except QuotaExceeded as e:
+        conn.commit()
+        log.warning("Dừng quét kênh: %s", e)
+    new_ids = classify_cached(cfg, conn, channels)
+    # lấy thống kê cho MỌI video chưa có (kể cả video mới của lần trước bị thiếu do hết quota)
+    need = [r[0] for r in conn.execute(
+        "SELECT video_id FROM videos WHERE fetched_at IS NULL AND status NOT IN ('excluded')")]
+    try:
+        refresh_videos(yt, conn, need, cfg)
     except (QuotaExceeded, YouTubeError) as e:
         log.warning("Chưa lấy được thống kê video: %s", e)
     log.info("Discover xong: %d video mới", len(new_ids))
     return len(new_ids)
+
+
+def reset_scan(conn, channel_ids=None):
+    """Xóa con trỏ quét để quét lại kênh từ đầu (giữ cache uploads)."""
+    if channel_ids:
+        conn.executemany("DELETE FROM channel_scan WHERE channel_id=?", [(c,) for c in channel_ids])
+    else:
+        conn.execute("DELETE FROM channel_scan")
+    conn.commit()
 
 
 def find_channels(cfg, yt, queries, calls=3):

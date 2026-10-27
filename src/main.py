@@ -49,12 +49,16 @@ def close_all(conn, ledger):
     conn.close()
 
 
-def job_discover(cfg):
+def job_discover(cfg, budget=None, rescan=False):
     conn, ledger, yt = ctx(cfg)
-    ledger.start_run((cfg.get("discover") or {}).get("run_budget_units", 300))
+    ledger.start_run(budget or (cfg.get("discover") or {}).get("run_budget_units", 300))
     try:
         from .models import write_registry
         write_registry(cfg)   # cập nhật data/models.json mỗi khi config đổi
+        if rescan:
+            from .discover import reset_scan
+            reset_scan(conn)
+            log.info("Đã xóa con trỏ quét: quét lại mọi kênh từ đầu playlist")
         run_discover(cfg, yt, conn)
     finally:
         close_all(conn, ledger)
@@ -88,7 +92,7 @@ def job_snapshot(cfg):
     conn, ledger, yt = ctx(cfg)
     ledger.start_run(100)
     try:
-        ids = [r[0] for r in conn.execute("SELECT video_id FROM videos WHERE status!='disabled'")]
+        ids = [r[0] for r in conn.execute("SELECT video_id FROM videos WHERE status NOT IN ('disabled','excluded')")]
         refresh_videos(yt, conn, ids, cfg)
         log.info("Đã chụp số liệu %d video", len(ids))
     finally:
@@ -131,14 +135,39 @@ def cmd_status(cfg):
     for r in conn.execute("SELECT model,status,COUNT(*) n,SUM(comment_count) c FROM videos GROUP BY 1,2 ORDER BY 1,2"):
         print(f"  {r['model']:6} {r['status']:12} {r['n']:4} video  ~{r['c'] or 0} comment")
     print("\nĐã cào:", conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0], "comment")
+    from .models import bounds
+    from .timeutil import parse
+    earliest = bounds(cfg)[0]
+    print(f"\nTiến độ quét uploads của kênh (cần quét về {earliest:%Y-%m-%d}):")
+    rows = conn.execute("""SELECT c.channel_id, c.title, s.head_pub, s.tail_pub, s.tail_done, s.pages,
+                             (SELECT COUNT(*) FROM uploads u WHERE u.channel_id=c.channel_id) cached,
+                             (SELECT COUNT(*) FROM videos v WHERE v.channel_id=c.channel_id AND v.status!='excluded') matched
+                           FROM channels c LEFT JOIN channel_scan s USING(channel_id) ORDER BY c.title""").fetchall()
+    enabled = {ch.get("channel_id") or ch.get("handle") or ch.get("id") for ch in cfg.get("channels") or []
+               if ch.get("enabled", True)}
+    for r in rows:
+        if r["channel_id"] not in enabled:
+            continue
+        if r["tail_done"] or (r["tail_pub"] and parse(r["tail_pub"]) < earliest):
+            state = "xong"
+        elif r["pages"]:
+            state = f"đang quét, tới {r['tail_pub'][:10]}"
+        else:
+            state = "chưa quét"
+        print(f"  {r['title'][:28]:28} {state:24} cache {r['cached']:6} video | khớp mẫu {r['matched']:4}")
 
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     p = argparse.ArgumentParser(prog="yt-crawler")
     sp = p.add_subparsers(dest="cmd", required=True)
-    for n in ("discover", "crawl", "run", "status", "snapshot-videos", "models"):
+    for n in ("crawl", "run", "status", "snapshot-videos", "models"):
         sp.add_parser(n)
+    ds = sp.add_parser("discover")
+    ds.add_argument("--budget", type=int, help="ngân sách quota cho lần chạy này (mặc định discover.run_budget_units)")
+    ds.add_argument("--rescan", action="store_true", help="quét lại mọi kênh từ đầu playlist (giữ cache)")
+    rm = sp.add_parser("repair-missing", help="sửa dữ liệu cũ: video đã đánh dấu cào nhưng comment không có trong data/raw")
+    rm.add_argument("--apply", action="store_true", help="ghi thật (mặc định chỉ báo cáo)")
     rn = sp.add_parser("resolve-names")
     rn.add_argument("--limit", type=int, default=20)
     fc = sp.add_parser("find-channels")
@@ -165,7 +194,10 @@ def main():
         acquire()   # chỉ một tiến trình ghi tại một thời điểm
 
     if a.cmd == "discover":
-        job_discover(cfg)
+        job_discover(cfg, a.budget, a.rescan)
+    elif a.cmd == "repair-missing":
+        from .repair_missing import repair
+        repair(cfg, a.apply)
     elif a.cmd == "crawl":
         job_crawl(cfg)
     elif a.cmd == "resolve-names":

@@ -76,13 +76,17 @@ class YouTube:
         items = self._call("channels.list", "channels", **p).get("items", [])
         return items[0] if items else None
 
+    def uploads_page(self, playlist_id, token=None):
+        """Một trang (50 video) của playlist uploads: (items, nextPageToken). 1 đơn vị quota."""
+        d = self._call("playlistItems.list", "playlistItems", part="snippet,contentDetails",
+                       playlistId=playlist_id, maxResults=50, pageToken=token)
+        return d.get("items", []), d.get("nextPageToken")
+
     def uploads(self, playlist_id):
         token = None
         while True:
-            d = self._call("playlistItems.list", "playlistItems", part="snippet,contentDetails",
-                           playlistId=playlist_id, maxResults=50, pageToken=token)
-            yield from d.get("items", [])
-            token = d.get("nextPageToken")
+            items, token = self.uploads_page(playlist_id, token)
+            yield from items
             if not token:
                 return
 

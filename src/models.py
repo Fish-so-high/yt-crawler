@@ -111,11 +111,12 @@ def bounds(cfg):
     return min(s["start"] for s in sp) - before, max(s["end"] for s in sp)
 
 
-def classify(cfg, title, published):
-    """Trả về tên mẫu (hoặc 'a|b' nếu nhiều mẫu) hoặc None. Video phải đăng trong cửa sổ video của mẫu đó."""
+def classify(cfg, title, published, sp=None):
+    """Trả về tên mẫu (hoặc 'a|b' nếu nhiều mẫu) hoặc None. Video phải đăng trong cửa sổ video của mẫu đó.
+    `sp`: kết quả specs(cfg) tính sẵn, truyền vào khi phân loại hàng loạt cho nhanh."""
     t = unaccent(title)
     before = timedelta(days=cfg["video_window_before_days"])
-    hits = [s["name"] for s in specs(cfg).values()
+    hits = [s["name"] for s in (sp or specs(cfg)).values()
             if s["start"] - before <= published <= s["end"]
             and any(a in t for a in s["aliases"]) and not any(x in t for x in s["exclude"])]
     return "|".join(sorted(hits)) or None
